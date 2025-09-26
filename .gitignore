@@ -1,0 +1,22 @@
+# --- Python / venv ---
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
+
+# --- Data artifacts (outputs you can regenerate) ---
+artifacts/
+!artifacts/.gitkeep   # allow keeping the folder if you add a placeholder
+
+# --- Notebooks checkpoints ---
+.ipynb_checkpoints/
+
+# --- Logs / temp ---
+*.log
+tmp/

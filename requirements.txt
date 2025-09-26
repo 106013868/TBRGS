@@ -1,0 +1,11 @@
+# data + graph basics
+pandas
+numpy
+
+# ML stack
+torch
+torchvision
+torchaudio
+tensorflow
+scikit-learn
+matplotlib

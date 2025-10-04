@@ -1,7 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Tuple, List
-from datetime import timedelta
 import numpy as np
 import pandas as pd
 
@@ -12,7 +11,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 
 # Paths / config
 ROOT = Path(__file__).resolve().parents[2]
-DATA_PATH   = ROOT / "artifacts" / "processed_data.csv"   # you renamed it
+DATA_PATH   = ROOT / "artifacts" / "processed_data.csv"
 MODEL_PATH  = ROOT / "artifacts" / "gru_model.keras"
 OUTPUT_PATH = ROOT / "artifacts" / "gru_predictions.csv"
 
@@ -33,8 +32,7 @@ VPH_COL = "volume_vph"
 ROAD_COL = "First_Road"
 
 # Methods
-def load_features(path: Path) -> pd.DataFrame:
-    """Load processed CSV and standardize column names."""
+def load_processed_data(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"processed_data.csv not found at: {path}")
     print("Loading features…")
@@ -116,7 +114,7 @@ def make_gru_model(input_steps: int) -> Sequential:
 
 # Main
 def main():
-    df = load_features(DATA_PATH)
+    df = load_processed_data(DATA_PATH)
 
     # Keep sites with enough hours
     counts = df.groupby("hf_id")["datetime"].count()

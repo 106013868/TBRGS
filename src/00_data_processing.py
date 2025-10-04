@@ -1,488 +1,284 @@
-from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict, Tuple
-import math
-
 import pandas as pd
 import numpy as np
+import re
 
-
-# -----------------------------
 # Paths
-# -----------------------------
 ROOT = Path(__file__).resolve().parents[1]
-RAW_DIR = ROOT / "data_raw"
-ART_DIR = ROOT / "artifacts"
+RAW = ROOT / "data_raw"
+ART = ROOT / "artifacts"
+ART.mkdir(parents=True, exist_ok=True)
 
-# make sure artifacts folder exists
-ART_DIR.mkdir(parents=True, exist_ok=True)
+SITE_LISTING_CSV = RAW / "SCATSSiteListingSpreadsheet_VicRoads.csv"
+SCATS_CSV        = RAW / "Scats Data October 2006.csv"
+
+# Methods
+def norm_cell(x: object) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).replace("\u00A0", " ").strip()
+    return " ".join(s.split())
+
+def normalize_site_type(s: object) -> str:
+    if pd.isna(s):
+        return ""
+    t = str(s).upper().strip()
+    t = t.replace("FLASH PX", "POS")
+    return t
+
+def filter_int(t: str) -> bool:
+    return t == "INT"
+
+def extract_first_road(text: object) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+
+    s = text.upper().replace("_", " ").replace("-", " ").replace("\\", "/")
+    s = s.replace(".", " ")
+    s = " ".join(s.split())
+
+    # Cut off at direction/location phrases (N OF, SW OF, etc.)
+    cut = re.search(
+        r"\b(?:AT|OPP|NEAR|BETWEEN|INTERSECTION|"
+        r"(?:N|S|E|W|NE|NW|SE|SW)\s+OF)\b",
+        s
+    )
+    if cut:
+        s = s[:cut.start()].strip()
+
+    # Also stop at segment separators (include AND)
+    for sep in ["/", "&", " AND "]:
+        if sep in s:
+            s = s.split(sep)[0].strip()
+            break
+
+    tokens = re.findall(r"[A-Z0-9]+", s)
+    if not tokens:
+        return ""
+
+    # Recognized road types
+    TYPE_MAP = {
+        "ROAD":"RD", "RD":"RD",
+        "STREET":"ST", "ST":"ST",
+        "HIGHWAY":"HWY", "HWY":"HWY",
+        "FREEWAY":"FWY", "FWY":"FWY",
+        "AVENUE":"AVE", "AVE":"AVE",
+        "DRIVE":"DR", "DR":"DR",
+        "CRESCENT":"CRES", "CRES":"CRES",
+        "BOULEVARD":"BLVD", "BLVD":"BLVD",
+        "LANE":"LN", "LN":"LN",
+        "MOTORWAY":"MWY", "MWY":"MWY",
+        "PARKWAY":"PKWY", "PKWY":"PKWY",
+        "GROVE":"GV", "GV":"GV",
+        "ARTERIAL":"ARTERIAL" 
+    }
+    TYPE_SET = set(TYPE_MAP.keys())
+
+    if "ARTERIAL" in tokens[:6]:
+        idx = tokens.index("ARTERIAL")
+        base_tokens = tokens[:idx] or tokens[:1]
+        # Collapse initials like ['S','E'] -> 'SE'
+        if all(len(t) == 1 for t in base_tokens) and len(base_tokens) <= 3:
+            base = "".join(base_tokens)
+        else:
+            base = " ".join(base_tokens)
+        return f"{base} ARTERIAL".strip()
+
+    type_idx = -1
+    for i, t in enumerate(tokens[:6]):
+        if t in TYPE_SET:
+            type_idx = i
+    if type_idx != -1:
+        base_tokens = tokens[:type_idx] or tokens[:1]
+        base = " ".join(base_tokens)  # keep multi-word bases intact
+        final_type = TYPE_MAP[tokens[type_idx]]
+        return f"{base} {final_type}".strip()
+
+    # Defaults if no explicit type found
+    DEFAULT = {
+        "WARRIGAL":"RD","BURWOOD":"HWY","BURKE":"RD","CANTERBURY":"RD","BALWYN":"RD",
+        "MAROONDAH":"HWY","EASTERN":"FWY","MONASH":"FWY","RIVERSDALE":"RD",
+        "DONCASTER":"RD","CAMBERWELL":"RD","WHITEHORSE":"RD","GLENFERRIE":"RD",
+        "BARKERS":"RD","COTHAM":"RD","TOORAK":"RD","STUD":"RD","STATION":"ST",
+        "HIGH STREET":"RD"
+    }
+    if len(tokens) >= 2:
+        two = f"{tokens[0]} {tokens[1]}"
+        if two in DEFAULT:
+            return f"{two} {DEFAULT[two]}"
+    base = tokens[0]
+    if base in DEFAULT:
+        return f"{base} {DEFAULT[base]}"
+    return base
 
 
-# -----------------------------
-# Filenames
-# -----------------------------
-SITE_LISTING_CSV = "SCATSSiteListingSpreadsheet_VicRoads.csv"
-SCATS_QH_CSV     = "Scats Data October 2006.csv"
+def load_site_listing_int_scats() -> set[int]:
+    raw = pd.read_csv(SITE_LISTING_CSV, header=None)
 
-
-# -----------------------------
-# Quality rules
-# -----------------------------
-HOURS_PER_DAY = 24
-QUARTERS_PER_HOUR = 4
-MIN_QUARTERS_FOR_VALID_HOUR = 3     # 3 out of 4 quarters
-MIN_VALID_HOURS_FOR_VALID_DAY = 19  # 19 out of 24 hours (~80%)
-
-
-def make_quarter_columns() -> List[str]:
-    cols = []
-    for i in range(96):
-        # zero-padded like V00, V01, ..., V95
-        name = f"V{i:02d}"
-        cols.append(name)
-    return cols
-
-
-# -----------------------------
-# Normalize site type text
-# We only keep "INT" sites (intersections).
-# -----------------------------
-def normalize_site_type(text: str | float | None) -> str:
-    if text is None:
-        return "UNKNOWN"
-    if isinstance(text, float) and math.isnan(text):
-        return "UNKNOWN"
-
-    s = str(text)
-
-    s = s.upper().strip()
-
-    s = s.replace("ROUND A BOUT", "ROUNDABOUT")
-    s = s.replace("FLASH PX", "POS")
-    s = s.replace("FIRE WW", "FIRE")
-    s = s.replace("FIRESIG", "FIRE")
-    s = s.replace("AMBUSIG", "AMBULANCE")
-    s = s.replace("BUSSIG", "BUS")
-    s = s.replace("RAMPMTR", "RAMP")
-    s = s.replace("O/H", "OH")
-    s = s.replace("OHLANE", "HOV")
-
-    return s
-
-
-# -----------------------------
-# Step 1: read site listing and keep INT sites only
-# Expected columns in the CSV:
-# "Site Number", "Site Type"
-# -----------------------------
-def load_int_site_ids(site_listing_path: Path) -> set[int]:
-    if not site_listing_path.exists():
-        raise FileNotFoundError(f"Missing site listing CSV at {site_listing_path}")
-
-    # read without header because the file has intro lines above the real header
-    raw = pd.read_csv(site_listing_path, header=None)
-
-    # find the header row by looking for BOTH "Site Number" and "Site Type"
+    # detect header row
     header_row = None
-    for i in range(min(40, len(raw))):
-        row_vals = []
-        for v in raw.iloc[i].tolist():
-            # simple normalization: string, strip, collapse spaces, uppercase
-            s = "" if pd.isna(v) else str(v)
-            s = s.replace("\u00A0", " ").strip()
-            s = " ".join(s.split())
-            s = s.upper()
-            row_vals.append(s)
-        if ("SITE NUMBER" in row_vals) and ("SITE TYPE" in row_vals):
+    for i in range(min(100, len(raw))):
+        vals = [norm_cell(v).upper() for v in raw.iloc[i].tolist()]
+        if "SITE NUMBER" in vals and "SITE TYPE" in vals and ("LOCATION" in vals or "LOCATION DESCRIPTION" in vals):
             header_row = i
             break
-
     if header_row is None:
-        # show what we saw to help debug
-        print("[DEBUG] Could not find a header row with 'Site Number' and 'Site Type'.")
-        print("[DEBUG] First few rows:")
-        print(raw.head(10).to_string(index=False, header=False))
-        raise ValueError("Site listing CSV does not contain a clean header row.")
+        raise ValueError("Could not find header row in site listing CSV.")
 
-    # set that row as the header
-    header_names = []
-    for v in raw.iloc[header_row].tolist():
-        s = "" if pd.isna(v) else str(v)
-        s = s.replace("\u00A0", " ").strip()
-        s = " ".join(s.split())
-        header_names.append(s)
-    df = raw.iloc[header_row + 1:].reset_index(drop=True)
-    df.columns = header_names
+    header = [norm_cell(v) for v in raw.iloc[header_row].tolist()]
+    df = raw.iloc[header_row+1:].reset_index(drop=True)
+    df.columns = header
 
-    # now we expect these columns to exist
-    if "Site Number" not in df.columns or "Site Type" not in df.columns:
-        print("[DEBUG] Detected columns:", list(df.columns))
-        raise ValueError("Site listing is missing 'Site Number' or 'Site Type' after header detection.")
+    lower = {c.lower(): c for c in df.columns}
+    site_col = lower.get("site number")
+    type_col = lower.get("site type")
 
-    # normalize site type and keep INT only
-    norm_types = []
-    for val in df["Site Type"]:
-        norm_types.append(normalize_site_type(val))
-    df["Site Type Norm"] = norm_types
-    df = df[df["Site Type Norm"] == "INT"]
+    if not site_col or not type_col:
+        raise ValueError(f"Missing 'Site Number' or 'Site Type'. Found: {list(df.columns)}")
 
-    # collect integer site IDs
-    int_ids: set[int] = set()
-    for v in df["Site Number"]:
-        try:
-            num = int(pd.to_numeric(v))
-            int_ids.add(num)
-        except Exception:
-            pass
+    df["Site Type"] = df[type_col].apply(normalize_site_type)
+    df = df[df["Site Type"].apply(filter_int)].copy()
 
-    return int_ids
+    df["SCATS Number"] = pd.to_numeric(df[site_col], errors="coerce")
+    df = df[pd.notna(df["SCATS Number"])].copy()
+    df["SCATS Number"] = df["SCATS Number"].astype(int)
 
+    scats_set = set(df["SCATS Number"].tolist())
+    print(f"  INT-only SCATS entries in listing: {len(scats_set)}")
+    return scats_set
 
+# Load SCATS Oct 2006 → HF Number + SCATS Number + Date + Location + V00..V95
+def load_scats_qh_with_location() -> pd.DataFrame:
+    if not SCATS_CSV.exists():
+        raise FileNotFoundError(f"Missing {SCATS_CSV}")
 
-# -----------------------------
-# Step 2: read SCATS 15-minute CSV
-# We expect these columns:
-# "SCATS Number", "Date", "V00" .. "V95"
-# -----------------------------
-def load_scats_qh(scats_path: Path) -> pd.DataFrame:
-    if not scats_path.exists():
-        raise FileNotFoundError(f"Missing SCATS CSV at {scats_path}")
+    df = pd.read_csv(SCATS_CSV, header=1)
 
-    # Read raw with no header (since the real header may be lower in the file)
-    raw = pd.read_csv(scats_path, header=None)
+    required = ["SCATS Number", "HF VicRoads Internal", "Date", "Location"]
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column '{col}'. Found: {list(df.columns)}")
 
-    # Simple string normaliser for comparing header cells
-    def norm(x: object) -> str:
-        s = "" if pd.isna(x) else str(x)
-        s = s.replace("\u00A0", " ").strip()
-        s = " ".join(s.split())
-        return s
+    # rename
+    df = df.rename(columns={"HF VicRoads Internal": "HF Number"})
 
-    # 1) Find the row that contains SITE/DATE labels
-    site_keys = {"SCATS NUMBER", "SCATS SITE NUMBER", "SITE NUMBER", "SITE NO", "SCATS NO", "SCATS ID", "SID"}
-    date_keys = {"DATE", "COUNT DATE", "DAY", "DATE/TIME", "DATETIME"}
-
-    site_row_idx = None
-    for i in range(min(80, len(raw))):
-        vals = [norm(v).upper() for v in raw.iloc[i].tolist()]
-        vals_set = set(vals)
-        has_site = any(v in site_keys for v in vals_set)
-        has_date = any((v in date_keys) or ("DATE" in v) for v in vals_set)
-        if has_site and has_date:
-            site_row_idx = i
-            break
-
-    if site_row_idx is None:
-        print("[DEBUG] Could not find a header row with both site and date.")
-        print("[DEBUG] First 12 rows:")
-        print(raw.head(12).to_string(index=False, header=False))
-        raise ValueError("SCATS CSV does not have a recognizable site/date header row.")
-
-    # 2) Find the row that contains many TIME labels (0:00, 0.15, 00:30, etc.)
-    # Accept times like "0:00", "00:00", "0.15", "12:45 AM", etc.
-    import re
-    time_re = re.compile(r"^\s*(\d{1,2})[:\.](\d{2})(?:\s*(AM|PM))?\s*$", re.IGNORECASE)
-
-    def is_time_cell(txt: str) -> tuple[bool, int, int]:
-        m = time_re.match(txt)
-        if not m:
-            return (False, -1, -1)
-        hh = int(m.group(1))
-        mm = int(m.group(2))
-        mer = (m.group(3) or "").upper()
-        # Basic validity
-        if not (0 <= hh <= 23 and mm in (0, 15, 30, 45)):
-            # If AM/PM present, we’ll convert 12h to 24h below
-            if mm in (0, 15, 30, 45) and mer in {"AM", "PM"} and 1 <= hh <= 12:
-                # convert to 24h
-                hh24 = hh % 12
-                if mer == "PM":
-                    hh24 += 12
-                return (True, hh24, mm)
-            return (False, -1, -1)
-        return (True, hh, mm)
-
-    time_row_idx = None
-    time_cells_positions: list[tuple[int, int, int]] = []  # (col_index, HH, MM)
-    for i in range(site_row_idx, min(site_row_idx + 6, len(raw))):  # usually the next row or two
-        row = [norm(v) for v in raw.iloc[i].tolist()]
-        found = []
-        for j, cell in enumerate(row):
-            ok, hh, mm = is_time_cell(cell)
-            if ok:
-                found.append((j, hh, mm))
-        if len(found) >= 24:  # "many" time labels on this row
-            time_row_idx = i
-            time_cells_positions = found
-            break
-    # If not found near site row, scan a bit wider
-    if time_row_idx is None:
-        for i in range(min(120, len(raw))):
-            row = [norm(v) for v in raw.iloc[i].tolist()]
-            found = []
-            for j, cell in enumerate(row):
-                ok, hh, mm = is_time_cell(cell)
-                if ok:
-                    found.append((j, hh, mm))
-            if len(found) >= 24:
-                time_row_idx = i
-                time_cells_positions = found
-                break
-
-    if time_row_idx is None:
-        print("[DEBUG] Could not find a time-label row with many quarter-hours.")
-        print("[DEBUG] Site/Date header was at row index:", site_row_idx)
-        raise ValueError("SCATS CSV time header row not found.")
-
-    # 3) Build a merged header:
-    # - For each column j:
-    # * if time-row cell looks like a time -> map to V00..V95 (after sorting by HH:MM)
-    # * else take the site/date header cell (from site_row_idx)
-    site_header = [norm(v) for v in raw.iloc[site_row_idx].tolist()]
-    time_header = [norm(v) for v in raw.iloc[time_row_idx].tolist()]
-
-    # Create mapping from column index -> Vxx index
-    # Sort by true time order (HH*60 + MM), then enumerate 0..95
-    time_cells_positions.sort(key=lambda t: (t[1], t[2]))  # sort by (HH,MM)
-    if len(time_cells_positions) != 96:
-        print("[DEBUG] Detected time columns:", len(time_cells_positions), "(expected 96)")
-        print("[DEBUG] Example of detected times (first 16):",
-              [(c, f"{hh:02d}:{mm:02d}") for c, hh, mm in time_cells_positions[:16]])
-        raise ValueError("SCATS CSV does not contain exactly 96 quarter-hour columns labeled as HH:MM.")
-
-    idx_to_vname: dict[int, str] = {}
-    for k, (col_idx, hh, mm) in enumerate(time_cells_positions):
-        idx_to_vname[col_idx] = f"V{k:02d}"
-
-    # Build final header names (one per column)
-    max_cols = max(len(site_header), len(time_header))
-    final_header: list[str] = []
-    for j in range(max_cols):
-        if j in idx_to_vname:
-            final_header.append(idx_to_vname[j])
-        else:
-            # use site/date name (may be empty)
-            name = site_header[j] if j < len(site_header) else ""
-            final_header.append(name)
-
-    # 4) Create the data frame with merged header.
-    start_row = max(site_row_idx, time_row_idx) + 1
-    df = raw.iloc[start_row:].reset_index(drop=True)
-    # Some rows may be shorter; reindex columns to match header length
-    df = df.reindex(columns=range(len(final_header)))
-    df.columns = final_header
-
-    # 5) Find site and date columns (case-insensitive)
-    lower_map = {c.lower(): c for c in df.columns}
-
-    site_col = None
-    for key in ["scats number", "scats site number", "site number", "site no", "scats no", "scats id", "sid"]:
-        if key in lower_map:
-            site_col = lower_map[key]
-            break
-    if site_col is None:
-        for c in df.columns:
-            lc = c.lower()
-            if "site" in lc and any(tok in lc for tok in ["number", "no", "id"]):
-                site_col = c
-                break
-
-    date_col = None
-    for key in ["date", "count date", "day", "date/time", "datetime"]:
-        if key in lower_map:
-            date_col = lower_map[key]
-            break
-    if date_col is None:
-        for c in df.columns:
-            if "date" in c.lower():
-                date_col = c
-                break
-
-    if site_col is None or date_col is None:
-        print("[DEBUG] Columns after header merge (first 20):", list(df.columns)[:20])
-        raise ValueError("Could not find site or date column after header merge.")
-
-    # 6) Ensure we have all V00..V95 columns
+    # vcols are V00..V95 in this file
     vcols = [f"V{i:02d}" for i in range(96)]
-    missing_v = [c for c in vcols if c not in df.columns]
-    if missing_v:
-        print("[DEBUG] Missing V columns:", missing_v[:12], "…")
-        raise ValueError("After header merge, not all V00..V95 columns are present.")
+    miss = [c for c in vcols if c not in df.columns]
+    if miss:
+        raise ValueError(f"Missing expected quarter-hour columns: {miss[:8]}...")
 
-    # 7) Select and rename to canonical names
-    df = df.rename(columns={site_col: "SCATS Number", date_col: "Date"})
-    df = df[["SCATS Number", "Date"] + vcols]
+    # coerce types
+    df["HF Number"] = pd.to_numeric(df["HF Number"], errors="coerce")
+    df["SCATS Number"] = pd.to_numeric(df["SCATS Number"], errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
 
-    # 8) Drop rows without site/date
-    df = df.dropna(subset=["SCATS Number", "Date"], how="any")
+    df = df[pd.notna(df["HF Number"]) & pd.notna(df["SCATS Number"]) & pd.notna(df["Date"])].copy()
+    df = df[df["HF Number"] > 0].copy()
+    df["HF Number"] = df["HF Number"].astype(int)
+    df["SCATS Number"] = df["SCATS Number"].astype(int)
 
-    return df
+    # clean 15-min numeric
+    df[vcols] = (
+        df[vcols]
+          .replace(r"[^\d\.]+", "", regex=True)
+          .replace("", np.nan)
+          .apply(pd.to_numeric, errors="coerce")
+    )
 
+    # extract First_Road directly from Location (per row)
+    df["First_Road_raw"] = df["Location"].apply(extract_first_road)
 
+    return df[["HF Number","SCATS Number","Date","First_Road_raw"] + vcols].reset_index(drop=True)
 
+# Sum 96 quarters -> 24 hours
+def hourify_day(row: pd.Series, vcols: list[str]) -> list[float]:
+    vals = row[vcols].to_numpy(dtype=float)
+    if vals.size < 96:
+        vals = np.pad(vals, (0, 96 - vals.size), constant_values=np.nan)
+    return [np.nansum(vals[i:i+4]) for i in range(0, 96, 4)]
 
-# -----------------------------
-# Step 3: convert 15-minute to hourly for ONE row (one site, one day)
-# Returns a list of tuples: (hour_datetime, hourly_total, is_valid_hour)
-# -----------------------------
-def hourify_day(row: pd.Series) -> List[Tuple[pd.Timestamp, float, bool]]:
-    date_value = row["Date"]
-    # make sure we get a datetime at midnight for the day
-    day0 = pd.to_datetime(date_value).normalize()
-
-    result = []
-
-    # for each hour 0..23
-    for hour in range(HOURS_PER_DAY):
-        # quarter indices for this hour (0..95)
-        start_q = hour * QUARTERS_PER_HOUR
-        quarter_cols = [
-            f"V{start_q:02d}",
-            f"V{start_q + 1:02d}",
-            f"V{start_q + 2:02d}",
-            f"V{start_q + 3:02d}",
-        ]
-
-        # gather values and handle missing gracefully
-        quarter_vals = []
-        available_count = 0
-        for c in quarter_cols:
-            v = row.get(c, np.nan)
-            try:
-                v = float(v)
-            except Exception:
-                v = np.nan
-            if pd.notna(v):
-                quarter_vals.append(v)
-                available_count += 1
-
-        # sum of available quarters
-        if len(quarter_vals) > 0:
-            hour_sum = float(np.nansum(quarter_vals))
-        else:
-            hour_sum = np.nan
-
-        # decide if this hour is valid
-        is_valid_hour = (available_count >= MIN_QUARTERS_FOR_VALID_HOUR)
-
-        # the actual hour timestamp (e.g., 2006-10-01 13:00:00)
-        hour_time = day0 + pd.Timedelta(hours=hour)
-
-        # if hour is not valid, we will store NaN to make it obvious later
-        if not is_valid_hour:
-            hour_sum = np.nan
-
-        result.append((hour_time, hour_sum, is_valid_hour))
-
-    return result
-
-
-# -----------------------------
-# Step 4: main processing
-#   - filter SCATS rows to INT sites
-#   - per (site, date) aggregate to hourly
-#   - apply day validity rule (>=19 valid hours)
-#   - write outputs
-# -----------------------------
+# Main
 def main():
-    # 4.1 load INT site IDs
-    site_listing_path = RAW_DIR / SITE_LISTING_CSV
-    print("Reading site listing...")
-    int_site_ids = load_int_site_ids(site_listing_path)
-    print(f"  INT site IDs found: {len(int_site_ids)}")
+    print("Loading SCATS Site Listing (INT only)…")
+    int_scats_set = load_site_listing_int_scats()  # for filtering only
 
-    # 4.2 load SCATS quarter-hour table
-    scats_path = RAW_DIR / SCATS_QH_CSV
-    print("Reading SCATS 15-minute table...")
-    scats_df = load_scats_qh(scats_path)
+    print("Loading SCATS Oct-2006 (HF-based, with Location)…")
+    scats = load_scats_qh_with_location()
 
-    # Parse dates explicitly as DD/MM/YYYY to avoid warnings & mis-parsing
-    scats_df["Date"] = pd.to_datetime(scats_df["Date"], dayfirst=True, errors="coerce")
-    # Drop rows where Date couldn’t parse (should be rare)
-    scats_df = scats_df[pd.notna(scats_df["Date"])].copy()
+    # keep only rows whose SCATS Number is INT
+    before = len(scats)
+    scats = scats[scats["SCATS Number"].isin(int_scats_set)].copy()
+    print(f"  SCATS rows after INT filter: {len(scats)} (was {before})")
 
-    # 4.3 convert SCATS Number to integer site_id and filter to INT sites only
-    site_ids = []
-    for v in scats_df["SCATS Number"]:
-        try:
-            site_ids.append(int(pd.to_numeric(v)))
-        except Exception:
-            site_ids.append(np.nan)
-    scats_df["site_id"] = site_ids
-    scats_df = scats_df[pd.notna(scats_df["site_id"])]
-    scats_df["site_id"] = scats_df["site_id"].astype(int)
+    # Build HF -> First_Road mapping from the Location column:
+    # use the most frequent (mode) First_Road_raw per HF
+    hf_first = (
+        scats.groupby("HF Number")["First_Road_raw"]
+             .agg(lambda s: s.mode().iloc[0] if not s.mode().empty else (s.dropna().iloc[0] if not s.dropna().empty else ""))
+             .reset_index()
+             .rename(columns={"First_Road_raw": "First_Road"})
+    )
 
-    scats_df = scats_df[scats_df["site_id"].isin(int_site_ids)].copy()
-    if len(scats_df) == 0:
-        raise RuntimeError("After filtering to INT sites, there are no SCATS rows left. Check inputs.")
+    # Aggregate to hourly
+    vcols = [f"V{i:02d}" for i in range(96)]
+    hourly_rows = []
+    coverage_rows = []
 
-    # 4.4 aggregate to hourly with validity rules
-    print("Aggregating to hourly...")
-    records: List[Dict] = []   # for features_hourly.csv
-    coverage: List[Dict] = []  # for coverage_report.csv
+    for _, row in scats.iterrows():
+        hf_id = int(row["HF Number"])
+        day = row["Date"].normalize()
+        hours = hourify_day(row, vcols)
+        valid_hours = sum(1 for v in hours if pd.notna(v))
 
-    # group by site and date so we handle one full day at a time
-    # NOTE: SCATS file typically has one row per site per day already
-    grouped = scats_df.groupby(["site_id", "Date"], sort=True)
+        for h, val in enumerate(hours):
+            hourly_rows.append({
+                "hf_id": hf_id,
+                "datetime": day + pd.Timedelta(hours=h),
+                "volume_vph": float(val) if pd.notna(val) else 0.0
+            })
 
-    for (sid, date_val), group in grouped:
-        # take the first row (there should be only one)
-        row = group.iloc[0]
-
-        # convert quarters to hourly
-        hours_list = hourify_day(row)
-
-        # count valid hours for this day
-        valid_count = 0
-        for (dt, sum_v, ok) in hours_list:
-            if ok:
-                valid_count += 1
-
-        day_is_valid = (valid_count >= MIN_VALID_HOURS_FOR_VALID_DAY)
-
-        # record day coverage info (even if invalid, we want to see it in the report)
-        coverage.append({
-            "site_id": sid,
-            "date": pd.to_datetime(date_val).date(),
-            "valid_hours": valid_count,
-            "day_valid": day_is_valid
+        coverage_rows.append({
+            "hf_id": hf_id,
+            "date": day.date(),
+            "valid_hours": int(valid_hours),
+            "day_valid": bool(valid_hours >= 19)
         })
 
-        # only write hourly rows if the day is valid
-        if day_is_valid:
-            for (dt, sum_v, ok) in hours_list:
-                if ok and pd.notna(sum_v):
-                    records.append({
-                        "site_id": sid,
-                        "datetime": dt,
-                        "volume_vph": float(sum_v)
-                    })
+    features_df = pd.DataFrame(hourly_rows)
+    coverage_df = pd.DataFrame(coverage_rows)
 
-    # turn lists into DataFrames
-    features_df = pd.DataFrame(records)
-    coverage_df = pd.DataFrame(coverage)
+    # site_labels: HF + First_Road
+    site_labels = hf_first.rename(columns={"HF Number": "hf_id"})
 
-    # sort them nicely
-    if len(features_df) > 0:
-        features_df = features_df.sort_values(["site_id", "datetime"])
-    if len(coverage_df) > 0:
-        coverage_df = coverage_df.sort_values(["site_id", "date"])
+    # attach First_Road to features via HF mapping
+    features_df = features_df.merge(hf_first, left_on="hf_id", right_on="HF Number", how="left")
+    features_df.drop(columns=["HF Number"], inplace=True)
 
-    # 4.5 write outputs
-    out_features = ART_DIR / "features_hourly.csv"
-    out_coverage = ART_DIR / "coverage_report.csv"
+    # --- NEW: put First_Road immediately after hf_id ---
+    wanted = ["hf_id", "First_Road", "datetime", "volume_vph"]
+    features_df = features_df[wanted]
 
-    features_df.to_csv(out_features, index=False)
-    coverage_df.to_csv(out_coverage, index=False)
+    # write outputs
+    features_out = ART / "processed_data.csv"
+    coverage_out = ART / "coverage_report.csv"
+    labels_out   = ART / "site_labels.csv"
 
-    # little summary
+    features_df.to_csv(features_out, index=False)
+    coverage_df.to_csv(coverage_out, index=False)
+    site_labels.to_csv(labels_out, index=False)
+
+    # small summary
+    total_labels = len(site_labels)
+    missing_labels = int(site_labels["First_Road"].isna().sum() + (site_labels["First_Road"] == "").sum())
     print("\n=== DONE ===")
-    print(f"Sites in SCATS after INT filter: {scats_df['site_id'].nunique()}")
-    print(f"Hourly rows written:            {len(features_df):,}")
-    print(f"Coverage rows (site/day):       {len(coverage_df):,}")
-    print(f"Wrote: {out_features}")
-    print(f"Wrote: {out_coverage}")
-
+    print(f"HF sites in features: {features_df['hf_id'].nunique()}")
+    print(f"Hourly rows written:  {len(features_df):,}")
+    print(f"Coverage rows:        {len(coverage_df):,}")
+    print(f"Site labels:          {total_labels} (blank First_Road: {missing_labels})")
+    print("Wrote:", features_out)
+    print("Wrote:", coverage_out)
+    print("Wrote:", labels_out)
 
 if __name__ == "__main__":
     main()

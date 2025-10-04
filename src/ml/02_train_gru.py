@@ -1,164 +1,273 @@
-# Train a GRU to predict next-hour volume from the last 24 hours.
-# Inputs:
-#   artifacts/ml/windows.npz  -> X_train, y_train, X_val, y_val, X_test, y_test, t_*, s_*, window
-#   artifacts/ml/scalers.csv  -> per-site mean/std for inverse-scaling
-# Outputs:
-#   artifacts/ml/gru.pt                  (trained model weights)
-#   artifacts/predictions_gru.csv        (site_id, datetime, predicted/true volume)
-
+from __future__ import annotations
 from pathlib import Path
+from typing import Dict, Tuple, List
+from datetime import timedelta
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
 
-# --- paths ---
+# TensorFlow / Keras
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import GRU, Dense
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+
+# Paths / config
 ROOT = Path(__file__).resolve().parents[2]
-ART = ROOT / "artifacts"
-ART_ML = ART / "ml"
+DATA_PATH   = ROOT / "artifacts" / "processed_data.csv"   # you renamed it
+MODEL_PATH  = ROOT / "artifacts" / "gru_model.keras"
+OUTPUT_PATH = ROOT / "artifacts" / "gru_predictions.csv"
 
-# --- small helpers ---
-def load_windows():
-    npz = np.load(ART_ML / "windows.npz", allow_pickle=True)
-    X_train = npz["X_train"]; y_train = npz["y_train"]
-    X_val   = npz["X_val"];   y_val   = npz["y_val"]
-    X_test  = npz["X_test"];  y_test  = npz["y_test"]
-    t_train = npz["t_train"]; t_val   = npz["t_val"]; t_test = npz["t_test"]
-    s_train = npz["s_train"]; s_val   = npz["s_val"]; s_test = npz["s_test"]
-    window  = int(npz["window"][0])
-    scalers = pd.read_csv(ART_ML / "scalers.csv")  # site_id, mean, std
-    return (X_train, y_train, X_val, y_val, X_test, y_test,
-            t_train, t_val, t_test, s_train, s_val, s_test, window, scalers)
+# Windowing
+INPUT_STEPS   = 24 * 7   # history window length (168 hours)
+FORECAST_HRS  = 1        # predict next 1 hour
+MIN_SERIES_HR = 24 * 30  # require >= 30 days total per site
 
-class GRURegressor(nn.Module):
-    def __init__(self, input_size=1, hidden=64, num_layers=1):
-        super().__init__()
-        self.gru = nn.GRU(input_size=input_size, hidden_size=hidden,
-                          num_layers=num_layers, batch_first=True)
-        self.head = nn.Linear(hidden, 1)
+# Time splits (by absolute time across the month)
+TEST_DAYS = 7            # last 7 days are test
+VAL_DAYS  = 3            # last 3 days of the training portion are val (optional)
 
-    def forward(self, x):
-        # x shape: (B, T, 1)
-        out, _ = self.gru(x)     # out: (B, T, hidden)
-        last = out[:, -1, :]     # take last time step (B, hidden)
-        yhat = self.head(last)   # (B, 1)
-        return yhat
+# Training
+EPOCHS     = 20
+BATCH_SIZE = 256
 
-def make_loader(X, y, batch=64, shuffle=False):
-    X_t = torch.from_numpy(X.astype(np.float32))
-    y_t = torch.from_numpy(y.astype(np.float32))
-    ds = torch.utils.data.TensorDataset(X_t, y_t)
-    return torch.utils.data.DataLoader(ds, batch_size=batch, shuffle=shuffle, drop_last=False)
+VPH_COL = "volume_vph"
+ROAD_COL = "First_Road"
 
-def train(model, train_loader, val_loader, epochs=15, lr=1e-3, device="cpu"):
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
-    best_val = float("inf")
-    best_state = None
+# Methods
+def load_features(path: Path) -> pd.DataFrame:
+    """Load processed CSV and standardize column names."""
+    if not path.exists():
+        raise FileNotFoundError(f"processed_data.csv not found at: {path}")
+    print("Loading features…")
+    df = pd.read_csv(path, parse_dates=["datetime"])
 
-    for ep in range(1, epochs + 1):
-        # --- train ---
-        model.train()
-        train_loss_sum = 0.0
-        n_train = 0
-        for xb, yb in train_loader:
-            xb = xb.to(device); yb = yb.to(device)
-            opt.zero_grad()
-            pred = model(xb)
-            loss = loss_fn(pred, yb)
-            loss.backward()
-            opt.step()
-            train_loss_sum += loss.item() * len(xb)
-            n_train += len(xb)
-        train_mse = train_loss_sum / max(1, n_train)
+    # Flexible mapping (accepts different casings/aliases)
+    cols_lower = {c.lower(): c for c in df.columns}
+    hf_col   = cols_lower.get("hf_id")
+    road_col = cols_lower.get("first_road") or ("First_Road" if "First_Road" in df.columns else None)
+    vph_col  = cols_lower.get("volume_vph") or cols_lower.get("vehicle_vph")
 
-        # --- validate ---
-        model.eval()
-        val_loss_sum = 0.0
-        n_val = 0
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb = xb.to(device); yb = yb.to(device)
-                pred = model(xb)
-                loss = loss_fn(pred, yb)
-                val_loss_sum += loss.item() * len(xb)
-                n_val += len(xb)
-        val_mse = val_loss_sum / max(1, n_val)
+    if hf_col is None or road_col is None or vph_col is None or "datetime" not in df.columns:
+        raise ValueError(
+            f"processed_data.csv missing required columns. "
+            f"Found: {list(df.columns)}; need hf_id, First_Road/first_road, "
+            f"datetime, and volume_vph/vehicle_vph."
+        )
 
-        print(f"Epoch {ep:02d} | train MSE {train_mse:.4f} | val MSE {val_mse:.4f}")
+    df = df.rename(columns={hf_col: "hf_id", road_col: ROAD_COL, vph_col: VPH_COL})
+    df = df.dropna(subset=["hf_id", VPH_COL, "datetime"]).copy()
+    df["hf_id"] = df["hf_id"].astype(int)
+    df = df[["hf_id", ROAD_COL, "datetime", VPH_COL]].sort_values(["hf_id", "datetime"]).reset_index(drop=True)
+    return df
 
-        if val_mse < best_val:
-            best_val = val_mse
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+def make_continuous_hourly(df_site: pd.DataFrame) -> pd.DataFrame:
+    df_site = df_site.sort_values("datetime").reset_index(drop=True)
+    agg = (
+        df_site.groupby("datetime", as_index=True)
+               .agg({"hf_id": "first", ROAD_COL: "first", VPH_COL: "mean"})
+               .reset_index()
+    )
+    start, end = agg["datetime"].min(), agg["datetime"].max()
+    full_idx = pd.date_range(start=start, end=end, freq="h")
+    out = (
+        agg.set_index("datetime").reindex(full_idx)
+           .rename_axis("datetime").reset_index()
+    )
+    out["hf_id"] = out["hf_id"].ffill().bfill()
+    out[ROAD_COL] = out[ROAD_COL].ffill().bfill()
+    out[VPH_COL] = out[VPH_COL].interpolate(limit_direction="both")
+    return out
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+def build_sequences(values: np.ndarray,
+                    timestamps: np.ndarray,
+                    input_steps: int,
+                    forecast_hrs: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    xs, ys, ts = [], [], []
+    total = len(values)
+    end_idx = total - forecast_hrs
+    for i in range(input_steps, end_idx):
+        x = values[i - input_steps:i]
+        y = values[i:i + forecast_hrs].sum()
+        xs.append(x.reshape(-1, 1))
+        ys.append(y)
+        ts.append(timestamps[i + forecast_hrs - 1])
+    if not xs:
+        return np.zeros((0, input_steps, 1)), np.zeros((0,)), np.array([], dtype="datetime64[ns]")
+    return np.stack(xs), np.array(ys), np.array(ts)
+
+def time_split(df: pd.DataFrame):
+    last_time = df["datetime"].max()
+    test_start = last_time - pd.Timedelta(days=TEST_DAYS) + pd.Timedelta(hours=1)
+    train_all = df[df["datetime"] < test_start].copy()
+    test_df   = df[df["datetime"] >= test_start].copy()
+    if train_all.empty or test_df.empty:
+        raise RuntimeError("Train or Test split empty. Adjust TEST_DAYS or check data range.")
+    val_cut = train_all["datetime"].max() - pd.Timedelta(days=VAL_DAYS)
+    val_df  = train_all[train_all["datetime"] >= val_cut].copy()
+    train_df = train_all[train_all["datetime"] < val_cut].copy()
+    return train_df, val_df, test_df, test_start
+
+def make_gru_model(input_steps: int) -> Sequential:
+    model = Sequential([
+        GRU(64, input_shape=(input_steps, 1)),
+        Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
     return model
 
-def invert_scale(vec_scaled, site_ids, scalers_df):
-    means = scalers_df.set_index("site_id")["mean"].to_dict()
-    stds  = scalers_df.set_index("site_id")["std"].to_dict()
-    out = []
-    for z, sid in zip(vec_scaled, site_ids):
-        m = float(means.get(int(sid), 0.0))
-        s = float(stds.get(int(sid), 1.0))
-        out.append(float(z) * s + m)
-    return np.array(out, dtype=float)
-
+# Main
 def main():
-    # 0) load data
-    (X_tr, y_tr, X_va, y_va, X_te, y_te,
-     t_tr, t_va, t_te, s_tr, s_va, s_te, window, scalers) = load_windows()
+    df = load_features(DATA_PATH)
 
-    # 1) device selection
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Using device:", device)
+    # Keep sites with enough hours
+    counts = df.groupby("hf_id")["datetime"].count()
+    enough_sites = set(counts[counts >= MIN_SERIES_HR].index.tolist())
+    df = df[df["hf_id"].isin(enough_sites)].copy()
+    print(f"  Sites with >= {MIN_SERIES_HR} hours: {len(enough_sites)}")
 
-    # 2) build model + loaders (beginner defaults)
-    model = GRURegressor(input_size=1, hidden=64, num_layers=1).to(device)
-    train_loader = make_loader(X_tr, y_tr, batch=64, shuffle=True)
-    val_loader   = make_loader(X_va, y_va, batch=64, shuffle=False)
-    test_loader  = make_loader(X_te, y_te, batch=64, shuffle=False)
+    # Splits (by time)
+    train_df, val_df, test_df, test_start = time_split(df)
 
-    # 3) train
-    model = train(model, train_loader, val_loader, epochs=15, lr=1e-3, device=device)
+    # Per-site scalers (mean, std) from TRAIN ONLY
+    scalers: Dict[int, Tuple[float, float]] = {}
+    road_map = df[["hf_id", ROAD_COL]].drop_duplicates().set_index("hf_id")[ROAD_COL].to_dict()
 
-    # 4) test predictions (in scaled space)
-    model.eval()
-    preds_scaled_list = []
-    with torch.no_grad():
-        for xb, yb in test_loader:
-            xb = xb.to(device)
-            yhat = model(xb)                     # (B,1)
-            preds_scaled_list.append(yhat.cpu().numpy().reshape(-1))
-    preds_scaled = np.concatenate(preds_scaled_list, axis=0).reshape(-1)
+    # -------- Build TRAIN windows (fit scalers) --------
+    X_tr_list, y_tr_list = [], []
+    for hf, g in train_df.groupby("hf_id", sort=True):
+        g_full = make_continuous_hourly(g)
+        values = g_full[VPH_COL].to_numpy(dtype=float)
+        ts     = g_full["datetime"].to_numpy()
 
-    # 5) invert scaling to original units (vph)
-    y_test_scaled = y_te.reshape(-1)  # scaled truth
-    y_pred = invert_scale(preds_scaled, s_te, scalers)
-    y_true = invert_scale(y_test_scaled, s_te, scalers)
+        mean = float(np.nanmean(values))
+        std  = float(np.nanstd(values))
+        if std < 1e-6:
+            std = 1.0
+        scalers[int(hf)] = (mean, std)
 
-    # 6) simple metrics
-    mae  = float(np.mean(np.abs(y_pred - y_true)))
-    mape = float(np.mean(np.abs((y_pred - y_true) / np.clip(y_true, 1.0, None))) * 100.0)
-    print(f"Test MAE: {mae:.2f} vph | MAPE: {mape:.2f}%")
+        values = (values - mean) / std
+        X, y, _ = build_sequences(values, ts, INPUT_STEPS, FORECAST_HRS)
+        if len(X) > 0:
+            X_tr_list.append(X); y_tr_list.append(y)
 
-    # 7) save model
-    ART_ML.mkdir(parents=True, exist_ok=True)
-    model_path = ART_ML / "gru.pt"
-    torch.save(model.state_dict(), model_path)
-    print("Saved model:", model_path)
+    if not X_tr_list:
+        raise RuntimeError("No training sequences built. Try reducing INPUT_STEPS or MIN_SERIES_HR.")
 
-    # 8) save predictions (site_id, datetime, predicted, true) for inspection / routing
-    out = pd.DataFrame({
-        "site_id": s_te.astype(int),
-        "datetime": pd.to_datetime(t_te.astype("datetime64[s]")),
-        "predicted_volume_vph": y_pred,
-        "true_volume_vph": y_true
-    }).sort_values(["site_id", "datetime"])
-    out_path = ART / "predictions_gru.csv"
-    out.to_csv(out_path, index=False)
-    print("Saved predictions:", out_path)
+    X_train = np.concatenate(X_tr_list, axis=0)
+    y_train = np.concatenate(y_tr_list, axis=0)
+    print(f"  Train sequences: {X_train.shape}")
+
+    X_va_list, y_va_list = [], []
+    for hf, g in val_df.groupby("hf_id", sort=True):
+        if int(hf) not in scalers:
+            continue
+        g_full = make_continuous_hourly(g)
+        values = g_full[VPH_COL].to_numpy(dtype=float)
+        ts     = g_full["datetime"].to_numpy()
+
+        mean, std = scalers[int(hf)]
+        values = (values - mean) / std
+
+        X, y, _ = build_sequences(values, ts, INPUT_STEPS, FORECAST_HRS)
+        if len(X) > 0:
+            X_va_list.append(X); y_va_list.append(y)
+
+    if X_va_list:
+        X_val = np.concatenate(X_va_list, axis=0)
+        y_val = np.concatenate(y_va_list, axis=0)
+        val_data = (X_val, y_val)
+        print(f"  Val sequences:   {X_val.shape}")
+    else:
+        val_data = None
+        print("  No validation sequences (dataset/time split may be tight).")
+
+    # -------- Build & Train GRU --------
+    model = make_gru_model(INPUT_STEPS)
+    callbacks = [
+        EarlyStopping(monitor="val_loss" if val_data else "loss", patience=3, restore_best_weights=True),
+        ModelCheckpoint(MODEL_PATH, monitor="val_loss" if val_data else "loss", save_best_only=True)
+    ]
+    print("Training…")
+    model.fit(
+        X_train, y_train,
+        validation_data=val_data,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        verbose=1,
+        callbacks=callbacks
+    )
+    if not MODEL_PATH.exists():
+        model.save(MODEL_PATH)
+    print(f"Saved model to: {MODEL_PATH}")
+
+    print("Predicting on test…")
+    pred_rows: List[dict] = []
+    sites_seen_train = set(scalers.keys())
+    sites_in_test = sorted(test_df["hf_id"].unique().tolist())
+    print(f"  Test sites: {len(sites_in_test)} (overlap with train scalers: {len(sites_seen_train & set(sites_in_test))})")
+
+    built_sites = 0
+    skipped_no_scaler = 0
+    skipped_no_sequences = 0
+
+    # Build sequences from FULL site series but retain only targets in test window
+    for hf, g_all in df.groupby("hf_id", sort=True):
+        if int(hf) not in sites_in_test:
+            continue
+        if int(hf) not in scalers:
+            skipped_no_scaler += 1
+            continue
+
+        g_full = make_continuous_hourly(g_all)
+        values = g_full[VPH_COL].to_numpy(dtype=float)
+        ts     = g_full["datetime"].to_numpy()
+
+        mean, std = scalers[int(hf)]
+        values_scaled = (values - mean) / (std if std > 1e-6 else 1.0)
+
+        X, y_scaled, tgt_ts = build_sequences(values_scaled, ts, INPUT_STEPS, FORECAST_HRS)
+        if len(X) == 0:
+            skipped_no_sequences += 1
+            continue
+
+        # Keep only targets in the test period
+        mask = tgt_ts >= pd.to_datetime(test_start).to_datetime64()
+        if not mask.any():
+            skipped_no_sequences += 1
+            continue
+        X, y_scaled, tgt_ts = X[mask], y_scaled[mask], tgt_ts[mask]
+
+        built_sites += 1
+        yhat_scaled = model.predict(X, batch_size=512, verbose=0).reshape(-1)
+
+        # Unscale
+        y_true = y_scaled * std + mean
+        y_pred = yhat_scaled * std + mean
+
+        road = road_map.get(int(hf), "")
+        for i in range(len(y_pred)):
+            pred_rows.append({
+                "hf_id": int(hf),
+                ROAD_COL: road,
+                "datetime": pd.to_datetime(tgt_ts[i]),
+                "y_true_vph": float(max(0.0, y_true[i])),
+                "y_pred_vph": float(max(0.0, y_pred[i])),
+            })
+
+    print(f"  Built predictions for sites: {built_sites}")
+    print(f"  Skipped (no scaler): {skipped_no_scaler}")
+    print(f"  Skipped (no sequences): {skipped_no_sequences}")
+
+    if not pred_rows:
+        print("WARNING: No prediction rows were generated.")
+        empty = pd.DataFrame(columns=["hf_id", ROAD_COL, "datetime", "y_true_vph", "y_pred_vph"])
+        empty.to_csv(OUTPUT_PATH, index=False)
+        print(f"Wrote empty predictions file: {OUTPUT_PATH}")
+        return
+
+    preds = pd.DataFrame(pred_rows).sort_values(["hf_id", "datetime"]).reset_index(drop=True)
+    preds.to_csv(OUTPUT_PATH, index=False)
+    print(f"Wrote predictions: {OUTPUT_PATH}")
+    print("Done.")
 
 if __name__ == "__main__":
     main()

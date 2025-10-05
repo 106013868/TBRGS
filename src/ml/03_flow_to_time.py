@@ -11,7 +11,7 @@ import pandas as pd
 # ---------------------------
 # Paths (two folders up from this file)
 # ---------------------------
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PRED_PATH = ROOT / "artifacts" / "gru_predictions.csv"
 OUT_PATH  = ROOT / "artifacts" / "flow_speed_times.csv"
 

@@ -1,270 +1,285 @@
+# src/ml/02_train_gru.py
+# Train a GRU on per-site hourly vehicle_vph using a dynamic eligibility rule
+# and predict the last TEST_HOURS per site. Saves:
+#   artifacts/gru_model.keras
+#   artifacts/gru_predictions.csv
+#
+# Assumes artifacts/processed_data.csv with columns:
+#   hf_id, First_Road, datetime, volume_vph
+#
+# Uses a single global GRU across all eligible sites, scaling per-site.
+
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Tuple, List
+import sys
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+import tensorflow as tf
+from tensorflow.keras import layers, models
 
-# TensorFlow / Keras
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import GRU, Dense
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+# ---------------- Paths ----------------
+IS_FROZEN = getattr(sys, "frozen", False)
+if IS_FROZEN:
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parents[2]  # repo root
 
-# Paths / config
-ROOT = Path(__file__).resolve().parents[2]
-DATA_PATH   = ROOT / "artifacts" / "processed_data.csv"
-MODEL_PATH  = ROOT / "artifacts" / "gru_model.keras"
-OUTPUT_PATH = ROOT / "artifacts" / "gru_predictions.csv"
+ART = ROOT / "artifacts"
+ART.mkdir(parents=True, exist_ok=True)
 
-# Windowing
-INPUT_STEPS   = 24 * 7   # history window length (168 hours)
-FORECAST_HRS  = 1        # predict next 1 hour
-MIN_SERIES_HR = 24 * 30  # require >= 30 days total per site
+DATA_PATH  = ART / "processed_data.csv"     # <== renamed from features_hourly.csv
+MODEL_PATH = ART / "gru_model.keras"
+PRED_PATH  = ART / "gru_predictions.csv"
 
-# Time splits (by absolute time across the month)
-TEST_DAYS = 7            # last 7 days are test
-VAL_DAYS  = 3            # last 3 days of the training portion are val (optional)
+# ---------------- Windowing & eligibility params ----------------
+LOOKBACK      = 168   # hours of history per training sample (1 week)
+TEST_HOURS    = 168    # hours to predict per site
+# (We train 1-step ahead; predictions are made for the last TEST_HOURS timestamps.)
 
-# Training
-EPOCHS     = 20
-BATCH_SIZE = 256
+# Eligibility rule (same as 01_make_windows.py)
+HORIZON       = 24    # used only for MIN_HOURS calculation (kept consistent)
+MIN_WINDOWS   = 300
+MIN_WEEKS     = 3
+MIN_COVERAGE  = 0.80
 
-VPH_COL = "volume_vph"
-ROAD_COL = "First_Road"
+REQ_BY_WINDOWS = LOOKBACK + HORIZON + MIN_WINDOWS   # 168+24+300 = 492
+REQ_BY_WEEKS   = MIN_WEEKS * 168                    # 3*168 = 504
+MIN_HOURS_REQ  = max(REQ_BY_WINDOWS, REQ_BY_WEEKS)  # 504
 
-# Methods
-def load_processed_data(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"processed_data.csv not found at: {path}")
-    print("Loading features…")
-    df = pd.read_csv(path, parse_dates=["datetime"])
+# ---------------- Helpers ----------------
+def expected_hours_between(min_ts: pd.Timestamp, max_ts: pd.Timestamp) -> int:
+    if pd.isna(min_ts) or pd.isna(max_ts):
+        return 0
+    return int((max_ts - min_ts).total_seconds() // 3600) + 1
 
-    # Flexible mapping (accepts different casings/aliases)
-    cols_lower = {c.lower(): c for c in df.columns}
-    hf_col   = cols_lower.get("hf_id")
-    road_col = cols_lower.get("first_road") or ("First_Road" if "First_Road" in df.columns else None)
-    vph_col  = cols_lower.get("volume_vph") or cols_lower.get("vehicle_vph")
+def make_one_step_windows(series: np.ndarray, lookback: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Simple 1-step-ahead supervised dataset:
+    X[t] = series[t-lookback : t] (length = lookback)
+    y[t] = series[t] (the next value)
+    Returned shapes:
+      X: (num_samples, lookback, 1)
+      y: (num_samples,)
+    """
+    X, y = [], []
+    for t in range(lookback, len(series)):
+        X.append(series[t-lookback:t])
+        y.append(series[t])
+    X = np.array(X, dtype=np.float32).reshape(-1, lookback, 1)
+    y = np.array(y, dtype=np.float32).reshape(-1,)
+    return X, y
 
-    if hf_col is None or road_col is None or vph_col is None or "datetime" not in df.columns:
-        raise ValueError(
-            f"processed_data.csv missing required columns. "
-            f"Found: {list(df.columns)}; need hf_id, First_Road/first_road, "
-            f"datetime, and volume_vph/vehicle_vph."
-        )
-
-    df = df.rename(columns={hf_col: "hf_id", road_col: ROAD_COL, vph_col: VPH_COL})
-    df = df.dropna(subset=["hf_id", VPH_COL, "datetime"]).copy()
-    df["hf_id"] = df["hf_id"].astype(int)
-    df = df[["hf_id", ROAD_COL, "datetime", VPH_COL]].sort_values(["hf_id", "datetime"]).reset_index(drop=True)
-    return df
-
-def make_continuous_hourly(df_site: pd.DataFrame) -> pd.DataFrame:
-    df_site = df_site.sort_values("datetime").reset_index(drop=True)
-    agg = (
-        df_site.groupby("datetime", as_index=True)
-               .agg({"hf_id": "first", ROAD_COL: "first", VPH_COL: "mean"})
-               .reset_index()
-    )
-    start, end = agg["datetime"].min(), agg["datetime"].max()
-    full_idx = pd.date_range(start=start, end=end, freq="h")
-    out = (
-        agg.set_index("datetime").reindex(full_idx)
-           .rename_axis("datetime").reset_index()
-    )
-    out["hf_id"] = out["hf_id"].ffill().bfill()
-    out[ROAD_COL] = out[ROAD_COL].ffill().bfill()
-    out[VPH_COL] = out[VPH_COL].interpolate(limit_direction="both")
-    return out
-
-def build_sequences(values: np.ndarray,
-                    timestamps: np.ndarray,
-                    input_steps: int,
-                    forecast_hrs: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    xs, ys, ts = [], [], []
-    total = len(values)
-    end_idx = total - forecast_hrs
-    for i in range(input_steps, end_idx):
-        x = values[i - input_steps:i]
-        y = values[i:i + forecast_hrs].sum()
-        xs.append(x.reshape(-1, 1))
-        ys.append(y)
-        ts.append(timestamps[i + forecast_hrs - 1])
-    if not xs:
-        return np.zeros((0, input_steps, 1)), np.zeros((0,)), np.array([], dtype="datetime64[ns]")
-    return np.stack(xs), np.array(ys), np.array(ts)
-
-def time_split(df: pd.DataFrame):
-    last_time = df["datetime"].max()
-    test_start = last_time - pd.Timedelta(days=TEST_DAYS) + pd.Timedelta(hours=1)
-    train_all = df[df["datetime"] < test_start].copy()
-    test_df   = df[df["datetime"] >= test_start].copy()
-    if train_all.empty or test_df.empty:
-        raise RuntimeError("Train or Test split empty. Adjust TEST_DAYS or check data range.")
-    val_cut = train_all["datetime"].max() - pd.Timedelta(days=VAL_DAYS)
-    val_df  = train_all[train_all["datetime"] >= val_cut].copy()
-    train_df = train_all[train_all["datetime"] < val_cut].copy()
-    return train_df, val_df, test_df, test_start
-
-def make_gru_model(input_steps: int) -> Sequential:
-    model = Sequential([
-        GRU(64, input_shape=(input_steps, 1)),
-        Dense(1)
+def build_gru(input_len: int) -> tf.keras.Model:
+    model = models.Sequential([
+        layers.Input(shape=(input_len, 1)),
+        layers.GRU(64, return_sequences=True),
+        layers.GRU(32),
+        layers.Dense(1)
     ])
-    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+                  loss="mse",
+                  metrics=["mae"])
     return model
 
-# Main
+# ---------------- Main ----------------
 def main():
-    df = load_processed_data(DATA_PATH)
+    if not DATA_PATH.exists():
+        print(f"[ERROR] Missing input file: {DATA_PATH}")
+        sys.exit(1)
 
-    # Keep sites with enough hours
-    counts = df.groupby("hf_id")["datetime"].count()
-    enough_sites = set(counts[counts >= MIN_SERIES_HR].index.tolist())
-    df = df[df["hf_id"].isin(enough_sites)].copy()
-    print(f"  Sites with >= {MIN_SERIES_HR} hours: {len(enough_sites)}")
+    print("Loading features…")
+    df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
+    # basic cleaning & types
+    need_cols = {"hf_id", "datetime", "volume_vph"}
+    missing = need_cols - set(df.columns)
+    if missing:
+        print(f"[ERROR] processed_data.csv missing columns: {missing}")
+        sys.exit(1)
 
-    # Splits (by time)
-    train_df, val_df, test_df, test_start = time_split(df)
+    df = df.dropna(subset=["hf_id", "datetime", "volume_vph"]).copy()
+    df["hf_id"] = pd.to_numeric(df["hf_id"], errors="coerce")
+    df = df.dropna(subset=["hf_id"]).copy()
+    df["hf_id"] = df["hf_id"].astype(int)
 
-    # Per-site scalers (mean, std) from TRAIN ONLY
-    scalers: Dict[int, Tuple[float, float]] = {}
-    road_map = df[["hf_id", ROAD_COL]].drop_duplicates().set_index("hf_id")[ROAD_COL].to_dict()
+    # sort + dedup
+    df = df.sort_values(["hf_id", "datetime"]).drop_duplicates(["hf_id", "datetime"])
 
-    # -------- Build TRAIN windows (fit scalers) --------
-    X_tr_list, y_tr_list = [], []
-    for hf, g in train_df.groupby("hf_id", sort=True):
-        g_full = make_continuous_hourly(g)
-        values = g_full[VPH_COL].to_numpy(dtype=float)
-        ts     = g_full["datetime"].to_numpy()
+    # ---------------- Eligibility check ----------------
+    print(f"  Sites (unique hf_id): {df['hf_id'].nunique()}")
+    print(f"[ELIGIBILITY] MIN_HOURS_REQ={MIN_HOURS_REQ}, MIN_COVERAGE={MIN_COVERAGE:.0%}")
 
-        mean = float(np.nanmean(values))
-        std  = float(np.nanstd(values))
-        if std < 1e-6:
-            std = 1.0
-        scalers[int(hf)] = (mean, std)
+    eligible = []
+    for hf_id, g in df.groupby("hf_id", sort=False):
+        n_hours = g["datetime"].nunique()
+        t_min   = g["datetime"].min()
+        t_max   = g["datetime"].max()
+        exp     = expected_hours_between(t_min, t_max)
+        cov     = (n_hours / exp) if exp > 0 else 0.0
 
-        values = (values - mean) / std
-        X, y, _ = build_sequences(values, ts, INPUT_STEPS, FORECAST_HRS)
-        if len(X) > 0:
-            X_tr_list.append(X); y_tr_list.append(y)
+        ok_hours    = n_hours >= MIN_HOURS_REQ
+        ok_coverage = cov >= MIN_COVERAGE
+        included    = ok_hours and ok_coverage
 
-    if not X_tr_list:
-        raise RuntimeError("No training sequences built. Try reducing INPUT_STEPS or MIN_SERIES_HR.")
+        if included:
+            eligible.append(hf_id)
+        else:
+            if not ok_hours and not ok_coverage:
+                print(f"[SKIP] HF {hf_id}: hours {n_hours} < {MIN_HOURS_REQ} AND coverage {cov:.1%} < {MIN_COVERAGE:.0%}")
+            elif not ok_hours:
+                print(f"[SKIP] HF {hf_id}: hours {n_hours} < {MIN_HOURS_REQ}")
+            else:
+                print(f"[SKIP] HF {hf_id}: coverage {cov:.1%} < {MIN_COVERAGE:.0%}")
 
-    X_train = np.concatenate(X_tr_list, axis=0)
-    y_train = np.concatenate(y_tr_list, axis=0)
+    eligible = set(eligible)
+    print(f"[ELIGIBILITY] Eligible sites: {len(eligible)}")
+
+    # Keep only eligible sites
+    df = df[df["hf_id"].isin(eligible)].copy()
+
+    # ---------------- Train / Test split per site ----------------
+    # Strategy: per site, reserve the last TEST_HOURS for prediction (test),
+    # train on everything before that (still requires at least LOOKBACK+1 rows to form windows).
+    site_train_arrays = []
+    site_train_targets = []
+    scalers: dict[int, MinMaxScaler] = {}
+    test_slices: dict[int, pd.DataFrame] = {}
+
+    # Count how many sites remain with enough data to form at least 1 window after the split
+    sites_with_windows = 0
+
+    for hf_id, g in df.groupby("hf_id", sort=False):
+        g = g.sort_values("datetime").drop_duplicates("datetime")
+        # Must have enough total to support split and at least 1 training window
+        if len(g) < (LOOKBACK + 1):
+            print(f"[SKIP no windows] HF {hf_id}: len={len(g)} < {LOOKBACK + 1}")
+            continue
+
+        # Split into train (all but last TEST_HOURS) and test (last TEST_HOURS)
+        if len(g) <= TEST_HOURS + LOOKBACK:
+            # Not enough to leave a test tail + create windows
+            print(f"[SKIP short after split] HF {hf_id}: len={len(g)} (need > {TEST_HOURS + LOOKBACK})")
+            continue
+
+        train_g = g.iloc[: -TEST_HOURS].copy()
+        test_g  = g.iloc[-TEST_HOURS:].copy()
+
+        # Scale per-site using ONLY train data to avoid leakage
+        scaler = MinMaxScaler()
+        train_vals = train_g["volume_vph"].to_numpy(dtype=np.float32).reshape(-1, 1)
+        scaled_train = scaler.fit_transform(train_vals).reshape(-1)
+        scalers[hf_id] = scaler
+
+        # Build windows from scaled train series
+        X, y = make_one_step_windows(scaled_train, lookback=LOOKBACK)
+        if len(X) == 0:
+            print(f"[SKIP no train windows] HF {hf_id}: after lookback")
+            del scalers[hf_id]
+            continue
+
+        site_train_arrays.append(X)
+        site_train_targets.append(y)
+        test_slices[hf_id] = test_g
+        sites_with_windows += 1
+
+    if sites_with_windows == 0:
+        print("[WARN] No eligible sites produced windows after split. Nothing to train.")
+        # Write empty preds to keep pipeline consistent
+        pd.DataFrame(columns=["hf_id", "First_Road", "datetime", "pred_vph", "true_vph"]).to_csv(PRED_PATH, index=False)
+        print(f"Wrote empty predictions: {PRED_PATH}")
+        sys.exit(0)
+
+    X_train = np.concatenate(site_train_arrays, axis=0)
+    y_train = np.concatenate(site_train_targets, axis=0)
     print(f"  Train sequences: {X_train.shape}")
 
-    X_va_list, y_va_list = [], []
-    for hf, g in val_df.groupby("hf_id", sort=True):
-        if int(hf) not in scalers:
-            continue
-        g_full = make_continuous_hourly(g)
-        values = g_full[VPH_COL].to_numpy(dtype=float)
-        ts     = g_full["datetime"].to_numpy()
+    # ---------------- Build & train GRU ----------------
+    print("Building GRU…")
+    model = build_gru(input_len=LOOKBACK)
 
-        mean, std = scalers[int(hf)]
-        values = (values - mean) / std
-
-        X, y, _ = build_sequences(values, ts, INPUT_STEPS, FORECAST_HRS)
-        if len(X) > 0:
-            X_va_list.append(X); y_va_list.append(y)
-
-    if X_va_list:
-        X_val = np.concatenate(X_va_list, axis=0)
-        y_val = np.concatenate(y_va_list, axis=0)
-        val_data = (X_val, y_val)
-        print(f"  Val sequences:   {X_val.shape}")
-    else:
-        val_data = None
-        print("  No validation sequences (dataset/time split may be tight).")
-
-    # -------- Build & Train GRU --------
-    model = make_gru_model(INPUT_STEPS)
-    callbacks = [
-        EarlyStopping(monitor="val_loss" if val_data else "loss", patience=3, restore_best_weights=True),
-        ModelCheckpoint(MODEL_PATH, monitor="val_loss" if val_data else "loss", save_best_only=True)
-    ]
     print("Training…")
+    # No formal validation here (dataset is short and split per site). You can add a small val_split if desired.
     model.fit(
         X_train, y_train,
-        validation_data=val_data,
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        verbose=1,
-        callbacks=callbacks
+        batch_size=128,
+        epochs=20,
+        verbose=1
     )
-    if not MODEL_PATH.exists():
-        model.save(MODEL_PATH)
+
+    model.save(MODEL_PATH)
     print(f"Saved model to: {MODEL_PATH}")
 
+    # ---------------- Predict last TEST_HOURS per site ----------------
     print("Predicting on test…")
-    pred_rows: List[dict] = []
-    sites_seen_train = set(scalers.keys())
-    sites_in_test = sorted(test_df["hf_id"].unique().tolist())
-    print(f"  Test sites: {len(sites_in_test)} (overlap with train scalers: {len(sites_seen_train & set(sites_in_test))})")
+    pred_rows = []
 
-    built_sites = 0
-    skipped_no_scaler = 0
-    skipped_no_sequences = 0
-
-    # Build sequences from FULL site series but retain only targets in test window
-    for hf, g_all in df.groupby("hf_id", sort=True):
-        if int(hf) not in sites_in_test:
-            continue
-        if int(hf) not in scalers:
-            skipped_no_scaler += 1
+    for hf_id, test_g in test_slices.items():
+        road = (test_g["First_Road"].iloc[0] if "First_Road" in test_g.columns and len(test_g) > 0 else "")
+        # For 1-step-ahead predictions over last TEST_HOURS:
+        # We need the final LOOKBACK context just before the test block starts.
+        full_g = df[df["hf_id"] == hf_id].sort_values("datetime").drop_duplicates("datetime").copy()
+        # index where test starts
+        test_start_idx = len(full_g) - TEST_HOURS
+        # window context ends at test_start_idx - 1
+        context_start = test_start_idx - LOOKBACK
+        if context_start < 0:
+            print(f"[PRED skip] HF {hf_id}: not enough context for LOOKBACK")
             continue
 
-        g_full = make_continuous_hourly(g_all)
-        values = g_full[VPH_COL].to_numpy(dtype=float)
-        ts     = g_full["datetime"].to_numpy()
-
-        mean, std = scalers[int(hf)]
-        values_scaled = (values - mean) / (std if std > 1e-6 else 1.0)
-
-        X, y_scaled, tgt_ts = build_sequences(values_scaled, ts, INPUT_STEPS, FORECAST_HRS)
-        if len(X) == 0:
-            skipped_no_sequences += 1
+        # Use the trained scaler for this site (fit on train only)
+        scaler = scalers.get(hf_id, None)
+        if scaler is None:
+            print(f"[PRED skip] HF {hf_id}: no scaler")
             continue
 
-        # Keep only targets in the test period
-        mask = tgt_ts >= pd.to_datetime(test_start).to_datetime64()
-        if not mask.any():
-            skipped_no_sequences += 1
+        series = full_g["volume_vph"].to_numpy(dtype=np.float32).reshape(-1, 1)
+        # Scale using train scaler (applies to entire series; test may be out-of-range—ok)
+        scaled = scaler.transform(series).reshape(-1)
+
+        # Build windows that end exactly at each test point:
+        # For each test t (absolute index idx), we predict series[idx] from scaled[idx-LOOKBACK:idx]
+        # i.e., 1-step ahead aligned to the true test timestamps
+        X_list = []
+        dt_list = []
+        true_list = []
+        for k in range(TEST_HOURS):
+            idx = test_start_idx + k
+            left = idx - LOOKBACK
+            right = idx
+            if left < 0:
+                continue
+            X_list.append(scaled[left:right])
+            dt_list.append(full_g.iloc[idx]["datetime"])
+            true_list.append(float(full_g.iloc[idx]["volume_vph"]))
+
+        if len(X_list) == 0:
+            print(f"[PRED skip] HF {hf_id}: no test windows")
             continue
-        X, y_scaled, tgt_ts = X[mask], y_scaled[mask], tgt_ts[mask]
 
-        built_sites += 1
-        yhat_scaled = model.predict(X, batch_size=512, verbose=0).reshape(-1)
+        X_test = np.array(X_list, dtype=np.float32).reshape(-1, LOOKBACK, 1)
+        yhat_scaled = model.predict(X_test, verbose=0).reshape(-1, 1)
+        yhat = scaler.inverse_transform(yhat_scaled).reshape(-1)
 
-        # Unscale
-        y_true = y_scaled * std + mean
-        y_pred = yhat_scaled * std + mean
-
-        road = road_map.get(int(hf), "")
-        for i in range(len(y_pred)):
+        for dt, pred, true in zip(dt_list, yhat, true_list):
             pred_rows.append({
-                "hf_id": int(hf),
-                ROAD_COL: road,
-                "datetime": pd.to_datetime(tgt_ts[i]),
-                "y_true_vph": float(max(0.0, y_true[i])),
-                "y_pred_vph": float(max(0.0, y_pred[i])),
+                "hf_id": hf_id,
+                "First_Road": road,
+                "datetime": pd.to_datetime(dt),
+                "pred_vph": float(pred),
+                "true_vph": float(true)
             })
 
-    print(f"  Built predictions for sites: {built_sites}")
-    print(f"  Skipped (no scaler): {skipped_no_scaler}")
-    print(f"  Skipped (no sequences): {skipped_no_sequences}")
+        print(f"[PRED] HF {hf_id} ({road}): ok ({len(yhat)} preds)")
 
-    if not pred_rows:
+    if len(pred_rows) == 0:
         print("WARNING: No prediction rows were generated.")
-        empty = pd.DataFrame(columns=["hf_id", ROAD_COL, "datetime", "y_true_vph", "y_pred_vph"])
-        empty.to_csv(OUTPUT_PATH, index=False)
-        print(f"Wrote empty predictions file: {OUTPUT_PATH}")
-        return
+        pd.DataFrame(columns=["hf_id", "First_Road", "datetime", "pred_vph", "true_vph"]).to_csv(PRED_PATH, index=False)
+        print(f"Wrote empty predictions file: {PRED_PATH}")
+        sys.exit(0)
 
     preds = pd.DataFrame(pred_rows).sort_values(["hf_id", "datetime"]).reset_index(drop=True)
-    preds.to_csv(OUTPUT_PATH, index=False)
-    print(f"Wrote predictions: {OUTPUT_PATH}")
+    preds.to_csv(PRED_PATH, index=False)
+    print(f"Wrote predictions: {PRED_PATH}")
     print("Done.")
 
 if __name__ == "__main__":

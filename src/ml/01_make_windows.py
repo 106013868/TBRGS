@@ -1,212 +1,143 @@
+# src/ml/01_make_windows.py
+# Builds training windows eligibility using a dynamic rule and logs reasons for exclusion.
+# Writes:
+#   artifacts/windows_train.npz   (placeholder arrays – kept for compatibility/gating)
+#   artifacts/window_sites.csv    (metadata: per-HF hours, coverage, included)
+
+from __future__ import annotations
 from pathlib import Path
+import sys
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple, List
 
-# -------------------
-# Config / paths
-# -------------------
-ROOT = Path(__file__).resolve().parents[2]
+# ---------------- Paths ----------------
+IS_FROZEN = getattr(sys, "frozen", False)
+if IS_FROZEN:
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parents[2]  # <repo root>
+
 ART = ROOT / "artifacts"
 ART.mkdir(parents=True, exist_ok=True)
 
-FEATURES = ART / "processed_data.csv"
-META_OUT = ART / "window_meta.csv"
-TRAIN_NPZ = ART / "train.npz"
-VAL_NPZ   = ART / "val.npz"
-TEST_NPZ  = ART / "test.npz"
+INPUT_CSV = ART / "processed_data.csv"          # <== renamed from features_hourly.csv
+NPZ_OUT   = ART / "windows_train.npz"           # GUI Step 2 gating looks for this
+META_OUT  = ART / "window_meta.csv"
 
-# windowing
-INPUT_STEPS   = 24 * 7    # 7 days history
-FORECAST_HRS  = 1         # 1-step ahead
-MIN_SERIES_HR = 24 * 30   # at least 30 days per site
+# ---------------- Model/window parameters ----------------
+LOOKBACK      = 168   # hours of history per sample (1 week)
+HORIZON       = 24    # hours to predict (1 day) – not used for building here, but for eligibility math
+MIN_WINDOWS   = 300   # want at least this many training windows per HF
+MIN_WEEKS     = 3     # want at least 3 full weekly cycles
+MIN_COVERAGE  = 0.80  # 80% of expected hours across min..max datetime per HF
 
-# splits by time (last N days are test; last M of train are val)
-TEST_DAYS = 7
-VAL_DAYS  = 3
+# Derived minimum hours
+REQ_BY_WINDOWS = LOOKBACK + HORIZON + MIN_WINDOWS     # L + H + K
+REQ_BY_WEEKS   = MIN_WEEKS * 168
+MIN_HOURS_REQ  = max(REQ_BY_WINDOWS, REQ_BY_WEEKS)
 
-# -------------------
-# Helpers
-# -------------------
-def make_continuous_hourly(df_site: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure one row per hour per site.
-    - Collapse duplicate datetimes (some sites have repeats).
-    - Reindex to continuous hourly grid.
-    - Fill small gaps by interpolation.
-    """
-    # 1) sort
-    df_site = df_site.sort_values("datetime").reset_index(drop=True)
+def expected_hours_between(min_ts: pd.Timestamp, max_ts: pd.Timestamp) -> int:
+    """Inclusive number of hourly bins from min to max."""
+    if pd.isna(min_ts) or pd.isna(max_ts):
+        return 0
+    total = int((max_ts - min_ts).total_seconds() // 3600) + 1
+    return max(total, 0)
 
-    # 2) collapse duplicates at the same hour
-    #    choose aggregation that makes sense for your use (mean or sum):
-    agg = (
-        df_site.groupby("datetime", as_index=True)
-               .agg({
-                   "hf_id": "first",          # ID doesn't change within site
-                   "First_Road": "first",     # keep label
-                   "volume_vph": "mean"       # or "sum" if you prefer
-               })
-               .reset_index()
-    )
-
-    # 3) build continuous hourly index
-    start = agg["datetime"].min()
-    end   = agg["datetime"].max()
-    full_idx = pd.date_range(start=start, end=end, freq="h")  # use "h" (lowercase)
-
-    # 4) reindex to the continuous grid
-    out = (
-        agg.set_index("datetime")
-           .reindex(full_idx)
-           .rename_axis("datetime")
-           .reset_index()
-    )
-
-    # 5) forward/backward fill static columns; interpolate volume
-    out["hf_id"] = out["hf_id"].ffill().bfill()
-    out["First_Road"] = out["First_Road"].ffill().bfill()
-    out["volume_vph"] = out["volume_vph"].interpolate(limit_direction="both")
-
-    return out
-
-def build_sequences(values: np.ndarray,
-                    timestamps: np.ndarray,
-                    input_steps: int,
-                    forecast_hrs: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Sliding windows:
-      X: (n, T, 1) past T points
-      y: (n,) next 'forecast_hrs' sum (1-hr ahead here)
-      ts: (n,) timestamps of prediction target
-    """
-    xs, ys, ts = [], [], []
-    total = len(values)
-    end_idx = total - forecast_hrs
-    for i in range(input_steps, end_idx):
-        x = values[i - input_steps:i]
-        y = values[i:i + forecast_hrs].sum()
-        xs.append(x.reshape(-1, 1))
-        ys.append(y)
-        ts.append(timestamps[i + forecast_hrs - 1])
-    if not xs:
-        return np.zeros((0, input_steps, 1)), np.zeros((0,)), np.array([], dtype="datetime64[ns]")
-    return np.stack(xs), np.array(ys), np.array(ts)
-
-# -------------------
-# Main
-# -------------------
 def main():
-    print("Loading features_hourly.csv …")
-    df = pd.read_csv(FEATURES, parse_dates=["datetime"])
-    # Expect: ["hf_id","First_Road","datetime","volume_vph"]
-    need = {"hf_id","First_Road","datetime","volume_vph"}
-    missing = need - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns in features file: {missing}")
+    if not INPUT_CSV.exists():
+        print(f"[ERROR] Missing input: {INPUT_CSV}")
+        sys.exit(1)
 
-    df = df.sort_values(["hf_id","datetime"]).reset_index(drop=True)
+    print("Loading processed_data.csv …")
+    df = pd.read_csv(INPUT_CSV, parse_dates=["datetime"])
+    # Basic cleaning
+    df = df.dropna(subset=["hf_id", "datetime", "volume_vph"]).copy()
+    # Enforce types
+    df["hf_id"] = pd.to_numeric(df["hf_id"], errors="coerce")
+    df = df.dropna(subset=["hf_id"]).copy()
+    df["hf_id"] = df["hf_id"].astype(int)
+    # Sort + de-dup on (hf_id, datetime)
+    df = df.sort_values(["hf_id", "datetime"]).drop_duplicates(["hf_id", "datetime"])
 
-    # filter sites with enough data
-    counts = df.groupby("hf_id")["datetime"].count()
-    enough_sites = set(counts[counts >= MIN_SERIES_HR].index.tolist())
-    df = df[df["hf_id"].isin(enough_sites)].copy()
-    print(f"  Sites with >= {MIN_SERIES_HR} hours: {len(enough_sites)}")
+    # Summaries per site
+    meta_rows = []
+    eligible_hfs = []
 
-    # split by time
-    last_time = df["datetime"].max()
-    test_start = last_time - pd.Timedelta(days=TEST_DAYS) + pd.Timedelta(hours=1)
-    train_df = df[df["datetime"] < test_start].copy()
-    test_df  = df[df["datetime"] >= test_start].copy()
-    if train_df.empty or test_df.empty:
-        raise RuntimeError("Train or Test split is empty. Adjust TEST_DAYS.")
+    print(f"  Sites (unique hf_id): {df['hf_id'].nunique()}")
+    print(f"  Eligibility rule:")
+    print(f"    MIN_HOURS_REQ = max(L+H+MIN_WINDOWS, MIN_WEEKS*168) = "
+          f"max({LOOKBACK}+{HORIZON}+{MIN_WINDOWS}, {MIN_WEEKS}*168) = {MIN_HOURS_REQ}")
+    print(f"    MIN_COVERAGE  = {MIN_COVERAGE:.0%}\n")
 
-    val_cut = train_df["datetime"].max() - pd.Timedelta(days=VAL_DAYS)
-    val_df = train_df[train_df["datetime"] >= val_cut].copy()
+    for hf_id, g in df.groupby("hf_id"):
+        g = g.sort_values("datetime")
+        n_hours = g["datetime"].nunique()
+        t_min   = g["datetime"].min()
+        t_max   = g["datetime"].max()
+        exp_hours = expected_hours_between(t_min, t_max)
+        cov = (n_hours / exp_hours) if exp_hours > 0 else 0.0
 
-    # per-site scaler store (mean, std)
-    scalers: Dict[int, Tuple[float,float]] = {}
-    meta_rows: List[dict] = []
+        # Decide eligibility
+        ok_hours    = n_hours >= MIN_HOURS_REQ
+        ok_coverage = cov >= MIN_COVERAGE
+        included    = bool(ok_hours and ok_coverage)
 
-    # containers
-    X_tr_list, y_tr_list = [], []
-    X_va_list, y_va_list = [], []
-    X_te_list, y_te_list, te_info = [], [], []  # te_info keeps (hf_id, First_Road, ts)
+        meta_rows.append({
+            "hf_id": hf_id,
+            "First_Road": g["First_Road"].iloc[0] if "First_Road" in g.columns and len(g) > 0 else "",
+            "n_hours": n_hours,
+            "t_min": t_min,
+            "t_max": t_max,
+            "expected_hours": exp_hours,
+            "coverage_ratio": round(cov, 4),
+            "meets_hours": ok_hours,
+            "meets_coverage": ok_coverage,
+            "included": included
+        })
 
-    # ---- build TRAIN (fit scaler), VALID and TEST (reuse scaler) per site ----
-    # map for road names
-    road_map = df[["hf_id","First_Road"]].drop_duplicates().set_index("hf_id")["First_Road"].to_dict()
-
-    for split_name, subdf in [("train", train_df), ("val", val_df), ("test", test_df)]:
-        print(f"Building {split_name} windows …")
-        for hf, g in subdf.groupby("hf_id", sort=True):
-            g_full = make_continuous_hourly(g)
-            values = g_full["volume_vph"].to_numpy(dtype=float)
-            ts     = g_full["datetime"].to_numpy()
-
-            if split_name == "train":
-                mean = float(np.nanmean(values))
-                std  = float(np.nanstd(values))
-                if std < 1e-6:
-                    std = 1.0
-                scalers[int(hf)] = (mean, std)
-                # store meta once per site
-                meta_rows.append({
-                    "hf_id": int(hf),
-                    "First_Road": road_map.get(int(hf), ""),
-                    "mean": mean,
-                    "std": std
-                })
+        if not included:
+            # Print reason for exclusion (clear + specific)
+            if not ok_hours and not ok_coverage:
+                print(f"[SKIP] HF {hf_id}: hours {n_hours} < {MIN_HOURS_REQ} AND coverage {cov:.1%} < {MIN_COVERAGE:.0%}")
+            elif not ok_hours:
+                print(f"[SKIP] HF {hf_id}: hours {n_hours} < {MIN_HOURS_REQ}")
             else:
-                if int(hf) not in scalers:
-                    # site not seen in train (shouldn't happen with our split)
-                    continue
-                mean, std = scalers[int(hf)]
+                print(f"[SKIP] HF {hf_id}: coverage {cov:.1%} < {MIN_COVERAGE:.0%}")
+        else:
+            eligible_hfs.append(hf_id)
 
-            # scale
-            values = (values - mean) / std
-
-            X, y, tgt_ts = build_sequences(values, ts, INPUT_STEPS, FORECAST_HRS)
-            if len(X) == 0:
-                continue
-
-            if split_name == "train":
-                X_tr_list.append(X); y_tr_list.append(y)
-            elif split_name == "val":
-                X_va_list.append(X); y_va_list.append(y)
-            else:
-                X_te_list.append(X); y_te_list.append(y)
-                # keep info to reconstruct (hf_id, First_Road, datetime) later if needed
-                road = road_map.get(int(hf), "")
-                te_info.extend([(int(hf), road, t) for t in tgt_ts])
-
-    # concat and save
-    def concat_or_empty(lst, axis=0):
-        return np.concatenate(lst, axis=axis) if lst else np.zeros((0, INPUT_STEPS, 1))
-
-    X_train = concat_or_empty(X_tr_list)
-    y_train = np.concatenate(y_tr_list, axis=0) if y_tr_list else np.zeros((0,))
-    X_val   = concat_or_empty(X_va_list)
-    y_val   = np.concatenate(y_va_list, axis=0) if y_va_list else np.zeros((0,))
-    X_test  = concat_or_empty(X_te_list)
-    y_test  = np.concatenate(y_te_list, axis=0) if y_te_list else np.zeros((0,))
-
-    print(f"Shapes -> train: {X_train.shape}, val: {X_val.shape}, test: {X_test.shape}")
-
-    # save .npz
-    np.savez_compressed(TRAIN_NPZ, X=X_train, y=y_train)
-    np.savez_compressed(VAL_NPZ,   X=X_val,   y=y_val)
-    np.savez_compressed(TEST_NPZ,  X=X_test,  y=y_test)
-
-    # save meta with road names and scalers
-    meta_df = pd.DataFrame(meta_rows).sort_values("hf_id").reset_index(drop=True)
+    # Save metadata for inspection
+    meta_df = pd.DataFrame(meta_rows).sort_values(["included", "n_hours", "coverage_ratio", "hf_id"],
+                                                   ascending=[False, False, False, True])
     meta_df.to_csv(META_OUT, index=False)
+    print(f"\n[INFO] Eligibility summary written to: {META_OUT}")
+    print(f"[INFO] Eligible sites: {len(eligible_hfs)}")
 
-    print("Wrote:")
-    print(" ", TRAIN_NPZ)
-    print(" ", VAL_NPZ)
-    print(" ", TEST_NPZ)
-    print(" ", META_OUT)
+    # ---- Windows output (placeholder) ----
+    # Your GRU trainer builds windows itself, but the GUI uses this file as Step 2 “done” signal.
+    # We store minimal info so it’s harmless if not explicitly consumed by Step 3.
+    # If you *do* want to consume it later, extend here to actually build X/y arrays.
+    np.savez_compressed(
+        NPZ_OUT,
+        eligible_hf_ids=np.array(eligible_hfs, dtype=np.int32),
+        lookback=np.int32(LOOKBACK),
+        horizon=np.int32(HORIZON),
+        min_hours_req=np.int32(MIN_HOURS_REQ),
+        min_coverage=np.float32(MIN_COVERAGE),
+    )
+    print(f"[OK] Wrote: {NPZ_OUT}")
+
+    # Friendly recap for the console
+    if len(eligible_hfs) == 0:
+        print("\n[WARN] No eligible sites under current thresholds.")
+        print("       Consider relaxing MIN_WINDOWS or MIN_COVERAGE if your dataset is sparse.")
+    else:
+        # Show a couple of examples
+        ex = meta_df[meta_df["included"]].head(5)
+        print("\n[INFO] Example eligible sites:")
+        for _, r in ex.iterrows():
+            print(f"  HF {int(r['hf_id'])} ({r['First_Road']}): "
+                  f"{int(r['n_hours'])}h, cov={r['coverage_ratio']:.1%}")
 
 if __name__ == "__main__":
     main()

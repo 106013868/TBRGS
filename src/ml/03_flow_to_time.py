@@ -62,7 +62,7 @@ def process_model_predictions(model_name: str):
     cols_lower = {c.lower(): c for c in df.columns}
     hf_col   = cols_lower.get("hf_id")
     road_col = cols_lower.get("first_road") or ("First_Road" if "First_Road" in df.columns else None)
-    flow_col = cols_lower.get("y_pred_vph") or cols_lower.get("predicted_vph")
+    flow_col = cols_lower.get("y_pred_vph") or cols_lower.get("pred_vph")
 
     if hf_col is None or road_col is None or flow_col is None or "datetime" not in df.columns:
         print(f"WARNING: {model_name}_predictions.csv missing required columns. Skipping.")

@@ -1,5 +1,5 @@
 # src/ml/03_flow_to_time.py
-# Convert predicted flow (vph) -> speed (km/h) for all prediction files
+# Convert predicted flow (vph) to speed (km/h) for all prediction files.
 
 from __future__ import annotations
 from pathlib import Path
@@ -14,18 +14,15 @@ ARTIFACTS_PATH = ROOT / "artifacts"
 MODEL_NAMES = ["gru", "lstm", "custom"]
 
 # ---------------------------
-# Flow -> Speed constants (from assignment)
-# ... [A, B, CAPACITY_FLOW, SPEED_LIMIT_KMH definitions remain here]
+# Flow -> Speed constants
 # ---------------------------
 A = -1.4648375
 B = 93.75
 CAPACITY_FLOW = 1500.0
 SPEED_LIMIT_KMH = 60.0
 
-# [flow_to_speed_kmh function remains the same]
-
 def flow_to_speed_kmh(flow_vph: float) -> float:
-    # ... (function body remains the same as your original)
+    # Returns speed (km/h) given a flow rate (vehicles per hour) using a quadratic relationship.
     if flow_vph is None or not math.isfinite(flow_vph) or flow_vph <= 0:
         return SPEED_LIMIT_KMH
     D = B*B - 4*A*(-flow_vph)
@@ -49,7 +46,7 @@ def flow_to_speed_kmh(flow_vph: float) -> float:
 
 def process_model_predictions(model_name: str):
     pred_file = ARTIFACTS_PATH / f"{model_name}_predictions.csv"
-    out_file = ARTIFACTS_PATH / f"{model_name}_flow_speed_times.csv" # Separate output file
+    out_file = ARTIFACTS_PATH / f"{model_name}_flow_speed_times.csv"  # Separate output file
     
     if not pred_file.exists():
         print(f"Skipping {model_name}: Predictions file not found at {pred_file}")
@@ -58,7 +55,7 @@ def process_model_predictions(model_name: str):
     print(f"\n--- Processing {model_name.upper()} Predictions ---")
     df = pd.read_csv(pred_file, parse_dates=["datetime"])
 
-    # Flexible column mapping (same logic as before)
+    # Flexible column mapping
     cols_lower = {c.lower(): c for c in df.columns}
     hf_col   = cols_lower.get("hf_id")
     road_col = cols_lower.get("first_road") or ("First_Road" if "First_Road" in df.columns else None)
@@ -71,7 +68,7 @@ def process_model_predictions(model_name: str):
     df = df.rename(columns={hf_col: "hf_id", road_col: "First_Road", flow_col: "flow_vph"})
     df = df[["hf_id", "First_Road", "datetime", "flow_vph"]].copy()
 
-    print("Converting flow -> speed and saving …")
+    print("Converting flow -> speed and saving ...")
     df["speed_kmh"] = df["flow_vph"].apply(flow_to_speed_kmh)
 
     df = df.sort_values(["hf_id", "datetime"]).reset_index(drop=True)
@@ -82,8 +79,6 @@ def process_model_predictions(model_name: str):
 def main():
     for name in MODEL_NAMES:
         process_model_predictions(name)
-
-    print("\nNext step: Update your routing program to load the desired '_flow_speed_times.csv' file.")
 
 if __name__ == "__main__":
     main()

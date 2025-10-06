@@ -1,8 +1,8 @@
 # src/ml/01_make_windows.py
-# Builds training windows eligibility using a dynamic rule and logs reasons for exclusion.
+# Builds training-window eligibility using a dynamic rule and logs reasons for exclusion.
 # Writes:
-#   artifacts/windows_train.npz   (placeholder arrays – kept for compatibility/gating)
-#   artifacts/window_sites.csv    (metadata: per-HF hours, coverage, included)
+#   artifacts/windows_train.npz   (placeholder arrays — kept for compatibility/gating)
+#   artifacts/window_meta.csv     (metadata: per-HF hours, coverage, inclusion flag)
 
 from __future__ import annotations
 from pathlib import Path
@@ -15,20 +15,20 @@ IS_FROZEN = getattr(sys, "frozen", False)
 if IS_FROZEN:
     ROOT = Path(sys.executable).resolve().parent
 else:
-    ROOT = Path(__file__).resolve().parents[2]  # <repo root>
+    ROOT = Path(__file__).resolve().parents[2]  # repository root
 
 ART = ROOT / "artifacts"
 ART.mkdir(parents=True, exist_ok=True)
 
-INPUT_CSV = ART / "processed_data.csv"          # <== renamed from features_hourly.csv
+INPUT_CSV = ART / "processed_data.csv"          # renamed from features_hourly.csv
 NPZ_OUT   = ART / "windows_train.npz"           # GUI Step 2 gating looks for this
 META_OUT  = ART / "window_meta.csv"
 
 # ---------------- Model/window parameters ----------------
 LOOKBACK      = 168   # hours of history per sample (1 week)
-HORIZON       = 24    # hours to predict (1 day) – not used for building here, but for eligibility math
-MIN_WINDOWS   = 300   # want at least this many training windows per HF
-MIN_WEEKS     = 3     # want at least 3 full weekly cycles
+HORIZON       = 24    # hours to predict (1 day) — not used for building here; used for eligibility math
+MIN_WINDOWS   = 300   # at least this many training windows per HF
+MIN_WEEKS     = 3     # at least 3 full weekly cycles
 MIN_COVERAGE  = 0.80  # 80% of expected hours across min..max datetime per HF
 
 # Derived minimum hours
@@ -48,7 +48,7 @@ def main():
         print(f"[ERROR] Missing input: {INPUT_CSV}")
         sys.exit(1)
 
-    print("Loading processed_data.csv …")
+    print("Loading processed_data.csv ...")
     df = pd.read_csv(INPUT_CSV, parse_dates=["datetime"])
     # Basic cleaning
     df = df.dropna(subset=["hf_id", "datetime", "volume_vph"]).copy()
@@ -96,7 +96,7 @@ def main():
         })
 
         if not included:
-            # Print reason for exclusion (clear + specific)
+            # Print reason for exclusion (clear and specific)
             if not ok_hours and not ok_coverage:
                 print(f"[SKIP] HF {hf_id}: hours {n_hours} < {MIN_HOURS_REQ} AND coverage {cov:.1%} < {MIN_COVERAGE:.0%}")
             elif not ok_hours:
@@ -114,9 +114,9 @@ def main():
     print(f"[INFO] Eligible sites: {len(eligible_hfs)}")
 
     # ---- Windows output (placeholder) ----
-    # Your GRU trainer builds windows itself, but the GUI uses this file as Step 2 “done” signal.
-    # We store minimal info so it’s harmless if not explicitly consumed by Step 3.
-    # If you *do* want to consume it later, extend here to actually build X/y arrays.
+    # A GRU trainer may build windows internally, but the GUI uses this file as the Step 2 “done” signal.
+    # Minimal info is stored so it remains harmless if not explicitly consumed by Step 3.
+    # If this output is to be consumed later, extend here to actually build X/y arrays.
     np.savez_compressed(
         NPZ_OUT,
         eligible_hf_ids=np.array(eligible_hfs, dtype=np.int32),
@@ -130,14 +130,7 @@ def main():
     # Friendly recap for the console
     if len(eligible_hfs) == 0:
         print("\n[WARN] No eligible sites under current thresholds.")
-        print("       Consider relaxing MIN_WINDOWS or MIN_COVERAGE if your dataset is sparse.")
-    else:
-        # Show a couple of examples
-        ex = meta_df[meta_df["included"]].head(5)
-        print("\n[INFO] Example eligible sites:")
-        for _, r in ex.iterrows():
-            print(f"  HF {int(r['hf_id'])} ({r['First_Road']}): "
-                  f"{int(r['n_hours'])}h, cov={r['coverage_ratio']:.1%}")
+        print("       Consider relaxing MIN_WINDOWS or MIN_COVERAGE if the dataset is sparse.")
 
 if __name__ == "__main__":
     main()

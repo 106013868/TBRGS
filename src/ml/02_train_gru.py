@@ -1,13 +1,14 @@
 # src/ml/02_train_gru.py
-# Train a GRU on per-site hourly vehicle_vph using a dynamic eligibility rule
-# and predict the last TEST_HOURS per site. Saves:
+# Train a GRU on per-site hourly volume_vph using a dynamic eligibility rule,
+# then predict the last TEST_HOURS per site.
+# Saves:
 #   artifacts/gru_model.keras
 #   artifacts/gru_predictions.csv
 #
-# Assumes artifacts/processed_data.csv with columns:
+# Expects artifacts/processed_data.csv with columns:
 #   hf_id, First_Road, datetime, volume_vph
 #
-# Uses a single global GRU across all eligible sites, scaling per-site.
+# Uses a single global GRU across eligible sites, scaling per-site.
 
 from __future__ import annotations
 from pathlib import Path
@@ -23,22 +24,22 @@ IS_FROZEN = getattr(sys, "frozen", False)
 if IS_FROZEN:
     ROOT = Path(sys.executable).resolve().parent
 else:
-    ROOT = Path(__file__).resolve().parents[2]  # repo root
+    ROOT = Path(__file__).resolve().parents[2]  # repository root
 
 ART = ROOT / "artifacts"
 ART.mkdir(parents=True, exist_ok=True)
 
-DATA_PATH  = ART / "processed_data.csv"     # <== renamed from features_hourly.csv
+DATA_PATH  = ART / "processed_data.csv"     # renamed from features_hourly.csv
 MODEL_PATH = ART / "gru_model.keras"
 PRED_PATH  = ART / "gru_predictions.csv"
 
 # ---------------- Windowing & eligibility params ----------------
 LOOKBACK      = 168   # hours of history per training sample (1 week)
-TEST_HOURS    = 168    # hours to predict per site
-# (We train 1-step ahead; predictions are made for the last TEST_HOURS timestamps.)
+TEST_HOURS    = 168   # hours to predict per site
+# (Train 1-step ahead; predictions made for the last TEST_HOURS timestamps.)
 
-# Eligibility rule (same as 01_make_windows.py)
-HORIZON       = 24    # used only for MIN_HOURS calculation (kept consistent)
+# Eligibility rule (kept consistent with 01_make_windows.py)
+HORIZON       = 24    # used only for MIN_HOURS calculation
 MIN_WINDOWS   = 300
 MIN_WEEKS     = 3
 MIN_COVERAGE  = 0.80
@@ -55,10 +56,10 @@ def expected_hours_between(min_ts: pd.Timestamp, max_ts: pd.Timestamp) -> int:
 
 def make_one_step_windows(series: np.ndarray, lookback: int) -> tuple[np.ndarray, np.ndarray]:
     """
-    Simple 1-step-ahead supervised dataset:
-    X[t] = series[t-lookback : t] (length = lookback)
-    y[t] = series[t] (the next value)
-    Returned shapes:
+    One-step-ahead supervised dataset:
+      X[t] = series[t-lookback : t] (length = lookback)
+      y[t] = series[t] (the next value)
+    Returns:
       X: (num_samples, lookback, 1)
       y: (num_samples,)
     """
@@ -88,7 +89,7 @@ def main():
         print(f"[ERROR] Missing input file: {DATA_PATH}")
         sys.exit(1)
 
-    print("Loading features…")
+    print("Loading processed data file...")
     df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
     # basic cleaning & types
     need_cols = {"hf_id", "datetime", "volume_vph"}
@@ -194,11 +195,11 @@ def main():
     print(f"  Train sequences: {X_train.shape}")
 
     # ---------------- Build & train GRU ----------------
-    print("Building GRU…")
+    print("Building GRU...")
     model = build_gru(input_len=LOOKBACK)
 
-    print("Training…")
-    # No formal validation here (dataset is short and split per site). You can add a small val_split if desired.
+    print("Training...")
+    # No formal validation here (dataset is short and split per site). A small val_split can be added if desired.
     model.fit(
         X_train, y_train,
         batch_size=128,
@@ -210,13 +211,13 @@ def main():
     print(f"Saved model to: {MODEL_PATH}")
 
     # ---------------- Predict last TEST_HOURS per site ----------------
-    print("Predicting on test…")
+    print("Predicting on test...")
     pred_rows = []
 
     for hf_id, test_g in test_slices.items():
         road = (test_g["First_Road"].iloc[0] if "First_Road" in test_g.columns and len(test_g) > 0 else "")
         # For 1-step-ahead predictions over last TEST_HOURS:
-        # We need the final LOOKBACK context just before the test block starts.
+        # Use the final LOOKBACK context preceding the test block.
         full_g = df[df["hf_id"] == hf_id].sort_values("datetime").drop_duplicates("datetime").copy()
         # index where test starts
         test_start_idx = len(full_g) - TEST_HOURS
@@ -233,12 +234,10 @@ def main():
             continue
 
         series = full_g["volume_vph"].to_numpy(dtype=np.float32).reshape(-1, 1)
-        # Scale using train scaler (applies to entire series; test may be out-of-range—ok)
+        # Scale using train scaler (applies to entire series; test may be out-of-range—acceptable)
         scaled = scaler.transform(series).reshape(-1)
 
-        # Build windows that end exactly at each test point:
-        # For each test t (absolute index idx), we predict series[idx] from scaled[idx-LOOKBACK:idx]
-        # i.e., 1-step ahead aligned to the true test timestamps
+        # Build windows that end exactly at each test point
         X_list = []
         dt_list = []
         true_list = []
